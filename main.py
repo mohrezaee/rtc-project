@@ -11,7 +11,7 @@ import os
 NUM_TASKS = 10  # Number of tasks to generate
 NODES_RANGE = (5, 20)  # Range for the number of intermediate nodes per task
 WCET_RANGE = (13, 30)  # Range for the Worst-Case Execution Time (WCET) of nodes
-P_EDGE = 0.1  # Probability of creating an edge using the Erdős–Rényi method
+P_EDGE = 0.5  # Probability of creating an edge using the Erdős–Rényi method
 D_RATIO_RANGE = (0.125, 0.25)  # Range for the ratio of the critical path length to the deadline (for determining D_i)
 RESOURCE_RANGE = (1, 6)  # Range for the number of shared resources
 ACCESS_COUNT_RANGE = (1, 16)  # Range for the total number of accesses to each resource
