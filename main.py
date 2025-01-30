@@ -361,12 +361,12 @@ def main():
         print(f"\n--- Task tau_{t['task_id']} ---")
         print(f" • Total number of nodes (including source and sink): {t['num_nodes']}")
         print(f" • Ratio of critical nodes: {t['critical_ratio']:.2f}")
-        print(" • Nodes (ID -> WCET, Type):")
-        for n in range(t['num_nodes']):
-            wc = t['wcet'][n]
-            tp = t['node_types'][n]
-            print(f"    - {n}: c={wc}, type={tp}")
-        print(f" • Edges: {t['edges']}")
+        # print(" • Nodes (ID -> WCET, Type):")
+        # for n in range(t['num_nodes']):
+        #     wc = t['wcet'][n]
+        #     tp = t['node_types'][n]
+        #     print(f"    - {n}: c={wc}, type={tp}")
+        # print(f" • Edges: {t['edges']}")
         print(f" • C{t['task_id']} = {t['C']}")
         print(f" • L{t['task_id']} = {t['L']}")
         print(f" • D{t['task_id']} = {t['D']}")
