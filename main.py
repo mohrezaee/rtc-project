@@ -11,7 +11,7 @@ import os
 NUM_TASKS = 10  # Number of tasks to generate
 NODES_RANGE = (5, 20)  # Range for the number of intermediate nodes per task
 WCET_RANGE = (13, 30)  # Range for the Worst-Case Execution Time (WCET) of nodes
-P_EDGE = 0.5  # Probability of creating an edge using the Erdős–Rényi method
+P_EDGE = 0.1  # Probability of creating an edge using the Erdős–Rényi method
 D_RATIO_RANGE = (0.125, 0.25)  # Range for the ratio of the critical path length to the deadline (for determining D_i)
 RESOURCE_RANGE = (1, 6)  # Range for the number of shared resources
 ACCESS_COUNT_RANGE = (1, 16)  # Range for the total number of accesses to each resource
@@ -32,24 +32,28 @@ def create_random_dag(num_inner, p):
     """
     Creates a random Directed Acyclic Graph (DAG) using NetworkX with num_inner intermediate nodes (0..num_inner-1).
     For each pair of nodes (u < v), a directed edge (u -> v) is added with probability p (forward direction).
-    The function ensures that the resulting graph is acyclic by attempting topological sorting.
-    
+    The function ensures that the resulting graph is acyclic and connected by ensuring there is a path from the source
+    to the sink, and all intermediate nodes are reachable from the source and can reach the sink.
+
     Returns:
         G (nx.DiGraph): The generated DAG.
         node_types (dict): A dictionary mapping node IDs to their types ("Hard" or "Soft").
         ratio_crit (float): The ratio of critical nodes to total intermediate nodes.
     """
     total_nodes = num_inner + 2  # Including source and sink
+    source_id = num_inner
+    sink_id = num_inner + 1
+
     while True:
         G = nx.DiGraph()
-        G.add_nodes_from(range(num_inner))
+        G.add_nodes_from(range(total_nodes))
 
         # 1) Node Types: Initialize all intermediate nodes as Soft by default; source and sink will have type None
         node_types = {n: None for n in range(total_nodes)}
         for n in range(num_inner):
             node_types[n] = "Soft"
 
-        # 3) Determine the number of critical nodes based on a randomly selected ratio
+        # 2) Determine the number of critical nodes based on a randomly selected ratio
         ratio_crit = random.choice(CRITICAL_RATIOS)  # Select a ratio from the predefined list
         ratio_crit /= (ratio_crit + 1)  # Normalize the ratio
         num_crit = round(ratio_crit * num_inner)  # Calculate the number of critical nodes
@@ -57,18 +61,41 @@ def create_random_dag(num_inner, p):
         # Randomly select the critical nodes from the intermediate nodes
         crit_nodes = set(random.sample(range(num_inner), num_crit)) if num_inner > 0 else set()
 
-        # 2) Assign "Hard" type to critical nodes
+        # Assign "Hard" type to critical nodes
         for n in crit_nodes:
             node_types[n] = "Hard"
 
-        # Add edges between nodes based on the probability p, ensuring no constraints are violated
+        # 3) Add edges between nodes based on the probability p, ensuring no constraints are violated
         for u in range(num_inner):
             for v in range(u + 1, num_inner):
                 # Constraint: Do not add an edge if it would make a Soft node have a Hard child
                 if random.random() < p and not (node_types[u] == "Soft" and node_types[v] == "Hard"):
                     G.add_edge(u, v)
 
-        # Ensure the graph is acyclic by attempting a topological sort
+        # 4) Ensure connectivity:
+        # - Add edges from the source to at least one intermediate node.
+        # - Add edges from at least one intermediate node to the sink.
+        # - Ensure all intermediate nodes are reachable from the source and can reach the sink.
+
+        if num_inner > 0:
+            # Connect the source to at least one intermediate node
+            source_target = random.randint(0, num_inner - 1)
+            G.add_edge(source_id, source_target)
+
+            # Connect at least one intermediate node to the sink
+            sink_source = random.randint(0, num_inner - 1)
+            G.add_edge(sink_source, sink_id)
+
+            # Ensure all intermediate nodes are reachable from the source and can reach the sink
+            for n in range(num_inner):
+                if not nx.has_path(G, source_id, n):
+                    # Add an edge from the source to this node
+                    G.add_edge(source_id, n)
+                # if not nx.has_path(G, n, sink_id):
+                #     # Add an edge from this node to the sink
+                #     G.add_edge(n, sink_id)
+
+        # 5) Ensure the graph is acyclic by attempting a topological sort
         try:
             list(nx.topological_sort(G))
             return G, node_types, ratio_crit
@@ -107,7 +134,7 @@ def generate_one_task(task_id):
       3) Assign "Hard" or "Soft" types to intermediate nodes while respecting constraints.
       4) Select a random ratio of critical nodes and designate them.
       5) Calculate C_i, L_i, D_i, T_i, and U_i parameters.
-      6) Visualize and save the graph image.
+      6) Visualize and save the graph image using a tree-like layout.
 
     Args:
         task_id (int): The identifier for the task.
@@ -159,7 +186,8 @@ def generate_one_task(task_id):
     Ui = Ci / Ti if Ti > 0 else float('inf')  # Utilization U_i
 
     # 5) Visualize and save the DAG with different colors for Hard/Soft/Source/Sink nodes
-    pos = nx.spring_layout(G, seed=10)  # Fixed seed for reproducible layout
+    # Use a hierarchical layout to shape the graph as a tree
+    pos = hierarchy_pos(G, source_id)
 
     plt.figure(figsize=(8, 6))
     node_colors = []
@@ -200,6 +228,31 @@ def generate_one_task(task_id):
         "U": Ui
     }
 
+
+def hierarchy_pos(G, root, width=1.0, vert_gap=0.2, vert_loc=0, xcenter=0.5):
+    """
+    Create a hierarchical layout for a tree-like DAG.
+
+    Args:
+        G (nx.DiGraph): The input graph.
+        root (int): The root node of the tree.
+        width (float): Horizontal space allocated for the layout.
+        vert_gap (float): Vertical gap between levels.
+        vert_loc (float): Vertical location of the root node.
+        xcenter (float): Horizontal center of the layout.
+
+    Returns:
+        dict: A dictionary of positions keyed by node.
+    """
+    pos = {root: (xcenter, vert_loc)}
+    neighbors = list(G.successors(root))
+    if len(neighbors) != 0:
+        dx = width / len(neighbors)
+        nextx = xcenter - width / 2 - dx / 2
+        for neighbor in neighbors:
+            nextx += dx
+            pos.update(hierarchy_pos(G, neighbor, width=dx, vert_gap=vert_gap, vert_loc=vert_loc - vert_gap, xcenter=nextx))
+    return pos
 
 def generate_resources(num_tasks):
     """
