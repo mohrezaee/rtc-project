@@ -125,6 +125,109 @@ def compute_longest_path_length_dag(G, wcet):
                 dp[v] = dp[u] + wcet[v]
     return max(dp.values()) if dp else 0
 
+import networkx as nx
+
+def compute_is_on_critical_path(G, node_types, source_id, sink_id):
+    """
+    Marks each node in G as on a 'critical path' if it lies on some s->...->t path
+    that includes at least one Hard node.
+
+    :param G: nx.DiGraph (acyclic), containing nodes [0..N-1, source_id, sink_id].
+    :param node_types: dict { node_id: "Hard" or "Soft" or None }, e.g. from your code.
+    :param source_id: the unique source node's ID.
+    :param sink_id:   the unique sink node's ID.
+    :return: dict { node_id: bool } indicating whether each node is on a 'critical path'.
+    """
+
+    # 1) Find all nodes reachable from source (forward)
+    reachable_from_source = set()
+    queue = [source_id]
+    while queue:
+        u = queue.pop()
+        for v in G.successors(u):
+            if v not in reachable_from_source:
+                reachable_from_source.add(v)
+                queue.append(v)
+
+    # 2) Find all nodes that can reach sink (backward search)
+    can_reach_sink = set()
+    # We'll reverse the graph for convenience
+    G_rev = G.reverse()
+    queue = [sink_id]
+    while queue:
+        u = queue.pop()
+        for v in G_rev.successors(u):
+            if v not in can_reach_sink:
+                can_reach_sink.add(v)
+                queue.append(v)
+
+    # Now any node in ST = (reachable_from_source ∩ can_reach_sink) is on some path s->..->t
+    # But note we typically exclude source_id from that intersection if we want only "intermediate" nodes.
+    # For correctness, let's keep them if they are indeed in the intersection.
+    ST = set()
+    for v in G.nodes():
+        # Check if v != source_id and v != sink_id if you want
+        if v in reachable_from_source and v in can_reach_sink:
+            ST.add(v)
+
+    # 3) Among ST, find all Hard nodes
+    hard_nodes = [v for v in ST if node_types.get(v, None) == "Hard"]
+
+    # If no Hard nodes exist in ST, then no node is on a "critical path" by definition
+    # (since there's no path with a Hard node).
+    if not hard_nodes:
+        return { v: False for v in G.nodes() }
+
+    # 4) Create a subgraph G' restricted to ST
+    #    We'll do BFS forward/backward from each Hard node within ST to find all nodes
+    #    that can be on a path with that Hard node.
+    #    We accumulate them in a set 'critical_set'.
+    critical_set = set()
+
+    # A helper for forward BFS in subgraph ST
+    def bfs_forward(start):
+        queue = [start]
+        visited = {start}
+        while queue:
+            u = queue.pop(0)
+            for nxt in G.successors(u):
+                if nxt in ST and nxt not in visited:
+                    visited.add(nxt)
+                    queue.append(nxt)
+        return visited
+
+    # A helper for backward BFS in subgraph ST
+    def bfs_backward(start):
+        queue = [start]
+        visited = {start}
+        while queue:
+            u = queue.pop(0)
+            for nxt in G_rev.successors(u):
+                if nxt in ST and nxt not in visited:
+                    visited.add(nxt)
+                    queue.append(nxt)
+        return visited
+
+    # For each Hard node h, get:
+    #  - forward reach in ST
+    #  - backward reach in ST
+    # The union of those sets (and h itself) all lie on a path with h. 
+    # Because if v can reach h or be reached by h (within ST), there's an s->v->...->h->...->t or s->h->...->v->...->t path.
+    for h in hard_nodes:
+        fwd = bfs_forward(h)
+        bwd = bfs_backward(h)
+        # Union them
+        critical_set.update(fwd)
+        critical_set.update(bwd)
+
+    # 5) Build the final dict
+    #    A node is "on_critical_path" if it's in ST AND in critical_set.
+    is_on_crit = {}
+    for v in G.nodes():
+        is_on_crit[v] = (v in ST) and (v in critical_set)
+    
+    return is_on_crit
+
 
 def generate_one_task(task_id):
     """
@@ -214,7 +317,6 @@ def generate_one_task(task_id):
     output_path = os.path.join(OUTPUT_DIR, f"dag_task_{task_id}.png")
     plt.savefig(output_path, dpi=150)
     plt.close()
-
     return {
         "task_id": task_id,
         "num_nodes": total_nodes,
@@ -226,7 +328,10 @@ def generate_one_task(task_id):
         "L": Li,
         "D": Di,
         "T": Ti,
-        "U": Ui
+        "U": Ui,
+        "source_id": source_id,
+        "sink_id": sink_id,
+        "G": G
     }
 
 
@@ -589,11 +694,12 @@ def schedule_with_pomip(tasks, resources_info, policy="FIFO", time_limit=1000):
             needed_resource = None
             if t["node_types"][n] == "Hard":
                 needed_resource = 1  # say resource #1 is used by Hard nodes
+            is_crit_dict = compute_is_on_critical_path(t["G"], t["node_types"], t["source_id"], t["sink_id"])
             node_states[(tid, n)] = {
                 "remaining_time": wc,
                 "deadline": Di,
                 "is_critical_node": (t["node_types"][n] == "Hard"),
-                "on_critical_path": (t["node_types"][n] == "Hard"),  # or some other condition
+                "on_critical_path": is_crit_dict[n],
                 "locked_resource": None,
                 "in_critical_section": False,
                 "requesting_resource": needed_resource,  # if it needs a resource
