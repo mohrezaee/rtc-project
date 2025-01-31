@@ -8,7 +8,7 @@ from collections import deque
 # --------------------------------------------------------
 # 1) Global Parameter Settings (old variables)
 # --------------------------------------------------------
-NUM_TASKS = 5  # Number of tasks to generate
+NUM_TASKS = 2  # Number of tasks to generate
 NODES_RANGE = (5, 20)      # Range for # of intermediate nodes
 WCET_RANGE = (13, 30)      # Range for each node's WCET
 P_EDGE = 0.1               # Probability of edge creation in DAG
@@ -30,17 +30,14 @@ class Node:
         self.wcet = wcet
         self.is_hard = is_hard
         self.remaining_time = wcet
-        self.exec_progress = 0  # how many time units of execution have happened
+        self.exec_progress = 0
         self.resource_intervals = []  # list of (start, end, resource_id)
         self.in_critical_section = False
         self.completed = False
         self.locked_resource = None
         self.deadline = None  # assigned later
         self.task_id = None
-
-        # For QoS: We'll track the finishing time
         self.finish_time = None
-        # We might also track start_time, but you can add that if needed.
 
     def add_resource_interval(self, start, end, resource_id):
         self.resource_intervals.append((start, end, resource_id))
@@ -50,6 +47,14 @@ class Node:
             if s <= self.exec_progress < e:
                 return r_id
         return None
+    
+    def should_release_locked_resource(self):
+        if self.locked_resource is None:
+            return False
+        for (s, e, r_id) in self.resource_intervals:
+            if s <= self.exec_progress < e and r_id == self.locked_resource:
+                return False
+        return True
 
     def reset(self):
         self.remaining_time = self.wcet
@@ -63,28 +68,20 @@ class Resource:
     def __init__(self, resource_id, max_access_length):
         self.resource_id = resource_id
         self.global_queue = deque()
-        self.max_access_length = max_access_length
 
     def enqueue_global(self, item, policy="FIFO"):
         self.global_queue.append(item)
-        if policy == "FPC":
-            # Hard nodes come first, tie-break arrival_time
-            def priority(elem):
-                return (not elem["is_hard"], elem["arrival_time"])
-            sorted_list = sorted(self.global_queue, key=priority)
-            self.global_queue = deque(sorted_list)
+        if policy == "CPF":
+            self.global_queue = deque(sorted(self.global_queue, key=lambda x: (not x['is_critical'], x['arrival_time'])))
 
     def front(self):
         return self.global_queue[0] if self.global_queue else None
 
     def remove_item(self, node):
-        for i, it in enumerate(self.global_queue):
-            if it["node"] == node:
+        for i, item in enumerate(self.global_queue):
+            if item['node'] == node:
                 del self.global_queue[i]
                 break
-
-    def __repr__(self):
-        return f"Resource(id={self.resource_id})"
 
 class Task:
     def __init__(self, task_id, G, node_list, source_id, sink_id):
@@ -93,31 +90,18 @@ class Task:
         self.node_list = node_list
         self.source_id = source_id
         self.sink_id = sink_id
-
-        self.C = 0
-        self.L = 0
-        self.D = 0
-        self.T = 0
-        self.U = 0
-        self.critical_ratio = 0
-
-    def compute_params(self):
-        self.C = sum(n.wcet for n in self.node_list if n.wcet > 0)
-        wcet_map = {n.node_id: n.wcet for n in self.node_list}
-        self.L = compute_longest_path_length_dag(self.G, wcet_map)
-
-        ratio_d = random.uniform(*D_RATIO_RANGE)
-        self.D = int(self.L / ratio_d) if ratio_d != 0 else self.L
+        self.C = sum(n.wcet for n in node_list if n.wcet > 0)
+        self.L = compute_longest_path_length_dag(G, {n.node_id: n.wcet for n in node_list})
+        ratio_d = random.uniform(0.125, 0.25)
+        self.D = int(self.L / ratio_d) if ratio_d > 0 else self.L
         self.T = self.D
         self.U = self.C / self.T if self.T > 0 else float('inf')
+        for n in node_list:
+            n.deadline = self.D
 
     def reset_nodes(self):
-        for nd in self.node_list:
-            nd.reset()
-
-    def __repr__(self):
-        return (f"Task(id={self.task_id},C={self.C},L={self.L},"
-                f"D={self.D},U={self.U:.2f})")
+        for node in self.node_list:
+            node.reset()
 
 
 # --------------------------------------------------------
@@ -162,15 +146,12 @@ def create_random_dag(num_inner, p):
             continue
 
 def compute_longest_path_length_dag(G, wcet_map):
-    topo = list(nx.topological_sort(G))
-    dist = {}
-    for v in G.nodes():
-        dist[v] = wcet_map[v]
-    for u in topo:
+    topo_order = list(nx.topological_sort(G))
+    dist = {v: wcet_map[v] for v in G.nodes}
+    for u in topo_order:
         for v in G.successors(u):
-            if dist[v] < dist[u] + wcet_map[v]:
-                dist[v] = dist[u] + wcet_map[v]
-    return max(dist.values()) if dist else 0
+            dist[v] = max(dist[v], dist[u] + wcet_map[v])
+    return max(dist.values())
 
 def generate_one_task(task_id):
     num_inner = random.randint(*NODES_RANGE)
@@ -199,7 +180,6 @@ def generate_one_task(task_id):
 
     t = Task(task_id, G, node_list, source_id, sink_id)
     t.critical_ratio = ratio_crit
-    t.compute_params()
 
     # Assign deadlines to each node = T.D
     for nd in t.node_list:
@@ -259,14 +239,34 @@ def assign_resource_intervals_to_nodes(tasks, resources, resources_info):
             if usage_count <= 0:
                 continue
             candidate_nodes = [nd for nd in tasks[i].node_list if nd.wcet > 0]
-            for _ in range(usage_count):
-                if not candidate_nodes:
-                    break
-                nd = random.choice(candidate_nodes)
-                interval_length = random.randint(1, min(max_len, nd.wcet))
-                start = random.randint(0, nd.wcet - interval_length)
-                end = start + interval_length
-                nd.add_resource_interval(start, end, rid)
+
+            while usage_count > 0 and candidate_nodes:
+                node = random.choice(candidate_nodes)
+                candidate_nodes.remove(node)
+
+                # Avoid overlapping intervals or nested requests by checking conflicts
+                current_intervals = node.resource_intervals
+
+                for _ in range(usage_count):
+                    # Determine an interval length within the allowable bounds
+                    interval_length = random.randint(1, min(max_len, node.wcet))
+
+                    # Try multiple times to find a valid non-conflicting interval
+                    for _ in range(10):  # Give 10 tries to find a valid interval
+                        start = random.randint(0, node.wcet - interval_length)
+                        end = start + interval_length
+
+                        # Check for conflicts
+                        conflict = any(
+                            (s < end and start < e) and (r == rid)  # Overlap with same resource
+                            for (s, e, r) in current_intervals
+                        )
+
+                        if not conflict:
+                            node.add_resource_interval(start, end, rid)
+                            usage_count -= 1
+                            break
+
 
 # --------------------------------------------------------
 # 5) Federated Scheduling Code
@@ -323,92 +323,57 @@ def federated_output(tasks, n_r):
 # --------------------------------------------------------
 
 class POMIPScheduler:
-    """
-    - 1 CPU per task (federated).
-    - local_queues[(task_id, resource_id)] for each resource & task.
-    - We log scheduling decisions to produce a Gantt chart later.
-    - If any hard node misses its deadline => schedulable= False
-    - For non-critical nodes finishing after their deadline => QoS penalty
-    """
     def __init__(self, tasks, resources, policy="FIFO", time_limit=2000):
         self.tasks = tasks
         self.resources = resources
         self.policy = policy
         self.time_limit = time_limit
-
-        self.local_queues = {}
-        for t in tasks:
-            for r in resources:
-                self.local_queues[(t.task_id, r.resource_id)] = deque()
-
-        self.cluster_state = {}
-        for t in tasks:
-            self.cluster_state[t.task_id] = [None]  # 1 CPU for each task
-
+        self.local_queues = {(t.task_id, r.resource_id): deque() for t in tasks for r in resources}
+        self.cluster_state = {t.task_id: [None] for t in tasks}
         self.resource_map = {r.resource_id: r for r in resources}
-
-        # Logging: schedule_log[time][ (task_id) ] = node_id or None
-        # We'll store a record for each time step, for each cluster
         self.schedule_log = []
 
     def run(self):
-        schedulable = True
         time = 0
+        schedulable = True
         while time < self.time_limit:
             if self.all_done():
                 break
-
-            # We'll record occupant for each cluster this time step
             time_snapshot = {}
 
-            for t in self.tasks:
-                cpus = self.cluster_state[t.task_id]
-                occupant = cpus[0]
-                if occupant is None:
-                    nd = self.pick_node_to_run(t)
-                    if nd:
-                        cpus[0] = nd
-                        occupant = nd
-                if occupant is not None:
-                    # occupant runs
-                    resource_needed = occupant.get_resource_needed_now()
-                    if resource_needed is not None and not occupant.in_critical_section:
-                        # request resource
-                        r_obj = self.resource_map[resource_needed]
-                        self.request_resource_local_queue(occupant, r_obj, time)
-                        if not occupant.in_critical_section:
-                            # blocked => release CPU
-                            cpus[0] = None
-                            # attempt migration if can't run in home cluster
-                            ok = self.attempt_migration_if_blocked(occupant, resource_needed)
-                            occupant = None
+            for task in self.tasks:
+                cpu = self.cluster_state[task.task_id][0]
+                if cpu is None:
+                    node = self.pick_node_to_run(task)
+                    if node:
+                        self.cluster_state[task.task_id][0] = node
 
-                # If occupant is still occupant, run
-                if occupant is not None:
+                occupant = self.cluster_state[task.task_id][0]
+                if occupant:
+                    resource_id = occupant.get_resource_needed_now()
+                    if resource_id and not occupant.in_critical_section:
+                        resource = self.resource_map[resource_id]
+                        self.request_resource_local_queue(occupant, resource, time)
+                        if not occupant.in_critical_section:
+                            self.cluster_state[task.task_id][0] = None
+                            continue
+
                     occupant.remaining_time -= 1
                     occupant.exec_progress += 1
+                    if occupant.locked_resource and occupant.should_release_locked_resource():
+                        self.release_resource_local_queue(occupant, self.resource_map[occupant.locked_resource])
                     if occupant.remaining_time <= 0:
-                        occupant.finish_time = time+1  # record finishing
-                        if occupant.in_critical_section and occupant.locked_resource:
-                            r_obj = self.resource_map[occupant.locked_resource]
-                            self.release_resource_local_queue(occupant, r_obj)
                         occupant.completed = True
-                        cpus[0] = None
+                        occupant.finish_time = time + 1
+                        self.cluster_state[task.task_id][0] = None
 
-                # Record occupant node_id or None
-                if occupant is not None:
-                    time_snapshot[t.task_id] = occupant.node_id
-                else:
-                    time_snapshot[t.task_id] = None
+                time_snapshot[task.task_id] = occupant.node_id if occupant else None
 
-            # After the time-step, check deadlines
-            for t in self.tasks:
-                for nd in t.node_list:
-                    if nd.is_hard and not nd.completed:
-                        if time >= nd.deadline:
-                            # Critical node missed deadline => entire tasks unschedulable
-                            schedulable = False
-                            break
+            for task in self.tasks:
+                for node in task.node_list:
+                    if node.is_hard and not node.completed and time >= node.deadline:
+                        schedulable = False
+                        break
                 if not schedulable:
                     break
             if not schedulable:
@@ -417,126 +382,51 @@ class POMIPScheduler:
             self.schedule_log.append(time_snapshot)
             time += 1
 
-        # If we exit the loop but still have undone nodes => partial
-        if schedulable and not self.all_done():
-            schedulable = False
-
-        # Compute final QoS
         avg_qos = self.compute_qos()
-
-        return {
-            "schedulable": schedulable,
-            "finish_time": time,
-            "average_qos": avg_qos
-        }
+        return {"schedulable": schedulable, "finish_time": time, "average_qos": avg_qos}
 
     def compute_qos(self):
-        """
-        For each non-critical node:
-          - If it finishes <= node.deadline => QoS=100%
-          - If it finishes after => subtract 30% for each unit after
-          - min QoS is 0
-        Then average across all non-critical nodes
-        """
         total_qos = 0.0
-        count_noncrit = 0
-        for t in self.tasks:
-            for nd in t.node_list:
-                if nd.wcet<=0:
-                    continue
-                if nd.is_hard:
-                    # we only compute QoS for non-critical
-                    continue
-                count_noncrit += 1
-                if nd.finish_time is None:
-                    # never finished => QoS=0
-                    total_qos += 0
-                    continue
-                # check deadline
-                overrun = nd.finish_time - nd.deadline
-                if overrun <= 0:
-                    # finished on time
-                    total_qos += 1.0
-                else:
-                    # each time unit => -30%
-                    penalty = 0.30
-                    qval = 1.0 - penalty
-                    if qval < 0:
-                        qval = 0
-                    total_qos += qval
-        if count_noncrit == 0:
-            return 1.0  # or 0, or 1 meaning no non-critical => no QoS penalty
-        return total_qos / count_noncrit
+        count = 0
+        for task in self.tasks:
+            for node in task.node_list:
+                if not node.is_hard and node.wcet > 0:
+                    count += 1
+                    if node.finish_time is None:
+                        total_qos += 0
+                    else:
+                        delay = max(0, node.finish_time - node.deadline)
+                        total_qos += max(0, 1.0 - 0.30 * delay)
+        return total_qos / count if count else 1.0
 
     def all_done(self):
-        for t in self.tasks:
-            for nd in t.node_list:
-                if not nd.completed and nd.wcet>0:
-                    return False
-        return True
+        return all(node.completed for task in self.tasks for node in task.node_list if node.wcet > 0)
 
     def pick_node_to_run(self, task):
-        cands = []
-        for nd in task.node_list:
-            if not nd.completed and nd.remaining_time>0:
-                cands.append(nd)
-        # Hard first
-        c_hard = [x for x in cands if x.is_hard and not x.in_critical_section]
-        c_soft = [x for x in cands if not x.is_hard]
-        if c_hard:
-            return c_hard[0]
-        elif c_soft:
-            return c_soft[0]
-        else:
-            return None
+        candidates = [n for n in task.node_list if not n.completed]
+        hard_nodes = [n for n in candidates if n.is_hard]
+        if hard_nodes:
+            return hard_nodes[0]
+        soft_nodes = [n for n in candidates if not n.is_hard]
+        return soft_nodes[0] if soft_nodes else None
 
-    # ----------- Local & Global Queue Logic -----------
-
-    def request_resource_local_queue(self, node, resource_obj, current_time):
-        tid = node.task_id
-        rid = resource_obj.resource_id
-        fq = self.local_queues[(tid, rid)]
-
+    def request_resource_local_queue(self, node, resource, time):
+        fq = self.local_queues[(node.task_id, resource.resource_id)]
         if node not in fq:
             fq.append(node)
-
-        if fq and fq[0] == node:
-            item = {
-                "node": node,
-                "arrival_time": current_time,
-                "is_hard": node.is_hard
-            }
-            resource_obj.enqueue_global(item, policy=self.policy)
-            front_gq = resource_obj.front()
-            if front_gq and front_gq["node"] == node:
+        if fq[0] == node:
+            resource.enqueue_global({"node": node, "arrival_time": time, "is_critical": node.is_hard}, self.policy)
+            if resource.front()['node'] == node:
                 node.in_critical_section = True
-                node.locked_resource = rid
+                node.locked_resource = resource.resource_id
 
-    def release_resource_local_queue(self, node, resource_obj):
-        resource_obj.remove_item(node)
-        tid = node.task_id
-        rid = resource_obj.resource_id
-        fq = self.local_queues[(tid, rid)]
+    def release_resource_local_queue(self, node, resource):
+        resource.remove_item(node)
+        fq = self.local_queues[(node.task_id, resource.resource_id)]
         if fq and fq[0] == node:
             fq.popleft()
-        else:
-            if node in fq:
-                fq.remove(node)
         node.in_critical_section = False
         node.locked_resource = None
-        # next head
-        if fq:
-            head_node = fq[0]
-            item = {
-                "node": head_node,
-                "arrival_time": 0,
-                "is_hard": head_node.is_hard
-            }
-            resource_obj.enqueue_global(item, policy=self.policy)
-            front_gq = resource_obj.front()
-            if front_gq and front_gq["node"] == head_node:
-                head_node.in_critical_section = True
-                head_node.locked_resource = rid
 
     # ----------- POMIP Rules #1, #2 -----------
 
@@ -648,7 +538,7 @@ class POMIPScheduler:
 # --------------------------------------------------------
 
 def main():
-    random.seed(1)
+    random.seed(0)
 
     # 1) Generate tasks
     tasks = []
