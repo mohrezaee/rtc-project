@@ -8,7 +8,7 @@ from collections import deque
 # --------------------------------------------------------
 # 1) Global Parameter Settings (old variables)
 # --------------------------------------------------------
-NUM_TASKS = 10  # Number of tasks to generate
+NUM_TASKS = 5  # Number of tasks to generate
 NODES_RANGE = (5, 20)      # Range for # of intermediate nodes
 WCET_RANGE = (13, 30)      # Range for each node's WCET
 P_EDGE = 0.1               # Probability of edge creation in DAG
@@ -306,11 +306,10 @@ def hierarchy_pos(G, root, width=1.0, vert_gap=0.2, vert_loc=0, xcenter=0.5):
 # --------------------------------------------------------
 # 4) Resource Generation (like old code)
 # --------------------------------------------------------
-def generate_resources(num_tasks):
+def generate_resources(n_r, num_tasks):
     """
     Return a list of Resource plus metadata for printing.
     """
-    n_r = random.randint(*RESOURCE_RANGE)
     resources = []
     info_list = []
     for r_id in range(n_r):
@@ -681,7 +680,7 @@ def main():
 
     # 2) Generate some resources
     n_r = random.randint(*RESOURCE_RANGE)
-    resources, resources_info = generate_resources(n_r)
+    resources, resources_info = generate_resources(n_r, NUM_TASKS)
     assign_resource_intervals_to_nodes(tasks, resources, resources_info)
     # 3) Print federated info
     m_fed, m_simple = federated_output(tasks, n_r)
