@@ -414,15 +414,23 @@ class POMIPScheduler:
         self.resource_map = {r.resource_id: r for r in resources}
         self.schedule_log = []
 
+        # NEW: we keep track of partial QoS at each time
+        # This will be a list of tuples (time, partial_qos).
+        self.qos_over_time = []
+
     def run(self):
         time = 0
         schedulable = True
+
         while time < self.time_limit:
+            # 1) If all done, stop
             if self.all_done():
                 break
 
+            # 2) Log occupant state for Gantt
             time_snapshot = {}
 
+            # 3) Main scheduling loop
             for task in self.tasks:
                 occupant = self.cluster_state[task.task_id][0]
                 if occupant is None:
@@ -432,6 +440,7 @@ class POMIPScheduler:
                         occupant = node
 
                 if occupant:
+                    # Check if occupant wants resource
                     resource_id = occupant.get_resource_needed_now()
                     if resource_id and not occupant.in_critical_section:
                         res = self.resource_map[resource_id]
@@ -445,10 +454,12 @@ class POMIPScheduler:
                                     self.cluster_state[task.task_id][0] = None
                             occupant = self.cluster_state[task.task_id][0]
 
+                    # "run" occupant if still occupant
                     if occupant:
                         occupant.remaining_time -= 1
                         occupant.exec_progress += 1
 
+                        # Resource release check
                         if occupant.locked_resource and occupant.should_release_locked_resource():
                             self.release_resource_local_queue(occupant, self.resource_map[occupant.locked_resource])
                             if occupant.task_id != occupant.home_task_id:
@@ -459,14 +470,14 @@ class POMIPScheduler:
                             occupant.finish_time = time + 1
                             self.cluster_state[task.task_id][0] = None
 
-                # Log occupant
+                # Gantt log
                 occupant_final = self.cluster_state[task.task_id][0]
                 if occupant_final is not None:
                     time_snapshot[task.task_id] = (occupant_final.node_id, occupant_final.locked_resource)
                 else:
                     time_snapshot[task.task_id] = (None, None)
 
-            # Deadline check
+            # 4) Deadline check for Hard nodes
             for t in self.tasks:
                 for node in t.node_list:
                     if node.is_hard and not node.completed and time >= node.deadline:
@@ -477,11 +488,62 @@ class POMIPScheduler:
             if not schedulable:
                 break
 
+            # 5) Save snapshot and partial QoS
             self.schedule_log.append(time_snapshot)
+
+            # NEW: compute partial QoS so far (only among non-critical nodes that have finished)
+            partial_qos = self.compute_qos_so_far(time)
+            self.qos_over_time.append((time, partial_qos))
+
             time += 1
 
-        avg_qos = self.compute_qos()
+        # If we exit due to time limit, or tasks remain incomplete, we can still do final QoS
+        avg_qos = self.compute_final_qos()  # use final approach
         return {"schedulable": schedulable, "finish_time": time, "average_qos": avg_qos}
+
+    # NEW: partial QoS calculation at each time-step
+    def compute_qos_so_far(self, current_time):
+        """
+        Among all non-critical nodes that have *finished* at or before current_time,
+        compute the average QoS.
+          - If finishing_time <= deadline => QoS=1.0
+          - Else QoS = max(0, 1 - 0.3*(finish_time - deadline))
+        """
+        total_q = 0.0
+        count = 0
+
+        for t in self.tasks:
+            for nd in t.node_list:
+                if nd.is_hard or nd.wcet <= 0:
+                    continue
+                if nd.completed and nd.finish_time is not None and nd.finish_time <= current_time:
+                    count += 1
+                    overrun = max(0, nd.finish_time - nd.deadline)
+                    q = max(0, 1.0 - 0.3 * overrun)
+                    total_q += q
+
+        if count == 0:
+            return 0.0
+        return total_q / count
+
+    def compute_final_qos(self):
+        """
+        After scheduling finishes or time-limit reached, we do a final QoS 
+        among *all* non-critical nodes that eventually finished.
+        """
+        total_qos = 0.0
+        count = 0
+        for task in self.tasks:
+            for node in task.node_list:
+                if not node.is_hard and node.wcet>0:
+                    count += 1
+                    if node.finish_time is None:
+                        total_qos += 0
+                    else:
+                        delay = max(0, node.finish_time - node.deadline)
+                        q = max(0, 1.0 - 0.30*delay)
+                        total_qos += q
+        return total_qos / count if count else 1.0
 
     def apply_rule_one(self, task, blocking_node):
         for idx, occupant in enumerate(self.cluster_state[task.task_id]):
@@ -519,21 +581,6 @@ class POMIPScheduler:
                 node.home_task_id = None
                 return
 
-    def compute_qos(self):
-        total_qos = 0.0
-        count = 0
-        for task in self.tasks:
-            for node in task.node_list:
-                if not node.is_hard and node.wcet>0:
-                    count += 1
-                    if node.finish_time is None:
-                        total_qos += 0
-                    else:
-                        delay = max(0, node.finish_time - node.deadline)
-                        q = max(0, 1.0 - 0.30*delay)
-                        total_qos += q
-        return total_qos / count if count else 1.0
-    
     def all_done(self):
         return all(n.completed for t in self.tasks for n in t.node_list if n.wcet>0)
 
@@ -654,6 +701,28 @@ class POMIPScheduler:
         plt.savefig(filename)
         plt.close()
 
+def plot_qos_comparison(sched_fifo, sched_fpc):
+    import matplotlib.pyplot as plt
+
+    # Unpack the points
+    times_fifo = [pt[0] for pt in sched_fifo.qos_over_time]
+    qos_fifo   = [pt[1] for pt in sched_fifo.qos_over_time]
+
+    times_fpc  = [pt[0] for pt in sched_fpc.qos_over_time]
+    qos_fpc    = [pt[1] for pt in sched_fpc.qos_over_time]
+
+    plt.figure(figsize=(8,5))
+    plt.plot(times_fifo, qos_fifo, label="FIFO QoS", color='blue')
+    plt.plot(times_fpc, qos_fpc, label="FPC QoS", color='red')
+    plt.xlabel("Time")
+    plt.ylabel("Partial QoS (so far)")
+    plt.title("QoS Over Time: FIFO vs. FPC")
+    plt.legend()
+    plt.grid(True)
+    plt.tight_layout()
+    plt.savefig("qos_over_time_comparison.png")
+    plt.show()
+
 
 # --------------------------------------------------------
 # 7) Main
@@ -681,10 +750,10 @@ def main():
     print("\n=== POMIP (FIFO) ===")
     print("Schedulable?", fifo_result["schedulable"])
     print("Finish time:", fifo_result["finish_time"])
-    print("Avg QoS:", fifo_result["average_qos"])
+    print("Avg QoS (final):", fifo_result["average_qos"])
     sched_fifo.plot_schedule(title="POMIP-FIFO Gantt", filename="fifo_schedule.png")
 
-    # FPC (we interpret "FPC" as "sort by critical-path first")
+    # FPC
     for t in tasks:
         t.reset_nodes()
     sched_fpc = POMIPScheduler(tasks, resources, policy="FPC", time_limit=200)
@@ -692,9 +761,11 @@ def main():
     print("\n=== POMIP (FPC) ===")
     print("Schedulable?", fpc_result["schedulable"])
     print("Finish time:", fpc_result["finish_time"])
-    print("Avg QoS:", fpc_result["average_qos"])
+    print("Avg QoS (final):", fpc_result["average_qos"])
     sched_fpc.plot_schedule(title="POMIP-FPC Gantt", filename="fpc_schedule.png")
 
+    # Plot partial QoS over time
+    plot_qos_comparison(sched_fifo, sched_fpc)
 
 if __name__ == "__main__":
     main()
