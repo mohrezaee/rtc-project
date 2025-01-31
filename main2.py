@@ -8,7 +8,7 @@ from collections import deque
 # --------------------------------------------------------
 # 1) Global Parameter Settings (old variables)
 # --------------------------------------------------------
-NUM_TASKS = 100  # Number of tasks to generate
+NUM_TASKS = 10  # Number of tasks to generate
 NODES_RANGE = (5, 20)      # Range for # of intermediate nodes
 WCET_RANGE = (13, 30)      # Range for each node's WCET
 P_EDGE = 0.1               # Probability of edge creation in DAG
@@ -21,6 +21,86 @@ OUTPUT_DIR = "graphs_output"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 # --------------------------------------------------------
+# NEW: Function to compute is_on_critical_path for each node
+# --------------------------------------------------------
+def compute_is_on_critical_path(G, node_types, source_id, sink_id):
+    """
+    A node v is on a 'critical path' if it lies on a path s->...->t that 
+    includes at least one Hard node (which may be v or another node).
+    Steps:
+      1. Identify set ST of nodes that lie on *some* path from s to t.
+      2. Among ST, find which nodes are Hard => call that set H'.
+      3. For each h in H', do BFS forward/backward in ST => any node 
+         reachable from or reaching h is on a path with h => mark them.
+    Return a dict is_crit[v] = True/False.
+    """
+    # 1) Find all reachable from s
+    reachable_from_s = set()
+    queue = [source_id]
+    while queue:
+        u = queue.pop()
+        for v in G.successors(u):
+            if v not in reachable_from_s:
+                reachable_from_s.add(v)
+                queue.append(v)
+    # 2) Find all that can reach t (reverse BFS)
+    G_rev = G.reverse()
+    can_reach_t = set()
+    queue = [sink_id]
+    while queue:
+        u = queue.pop()
+        for v in G_rev.successors(u):
+            if v not in can_reach_t:
+                can_reach_t.add(v)
+                queue.append(v)
+
+    ST = set()
+    for v in G.nodes():
+        if v in reachable_from_s and v in can_reach_t:
+            ST.add(v)
+
+    # Among ST, find Hard nodes
+    hard_nodes = [v for v in ST if node_types[v] == "Hard"]
+
+    if not hard_nodes:
+        return {v: False for v in G.nodes()}
+
+    # BFS forward in subgraph ST, BFS backward in subgraph ST
+    def bfs_forward(start):
+        q = [start]
+        visited = {start}
+        while q:
+            u = q.pop(0)
+            for nxt in G.successors(u):
+                if nxt in ST and nxt not in visited:
+                    visited.add(nxt)
+                    q.append(nxt)
+        return visited
+
+    def bfs_backward(start):
+        q = [start]
+        visited = {start}
+        while q:
+            u = q.pop(0)
+            for nxt in G_rev.successors(u):
+                if nxt in ST and nxt not in visited:
+                    visited.add(nxt)
+                    q.append(nxt)
+        return visited
+
+    critical_set = set()
+    for h in hard_nodes:
+        fwd = bfs_forward(h)
+        bwd = bfs_backward(h)
+        critical_set.update(fwd)
+        critical_set.update(bwd)
+
+    is_crit = {}
+    for v in G.nodes():
+        is_crit[v] = (v in ST) and (v in critical_set)
+    return is_crit
+
+# --------------------------------------------------------
 # 2) Node, Resource, and Task Classes
 # --------------------------------------------------------
 
@@ -31,14 +111,17 @@ class Node:
         self.is_hard = is_hard
         self.remaining_time = wcet
         self.exec_progress = 0
-        self.resource_intervals = []  # list of (start, end, resource_id)
+        self.resource_intervals = []
         self.in_critical_section = False
         self.completed = False
         self.locked_resource = None
-        self.deadline = None  # assigned later
+        self.deadline = None
         self.task_id = None
         self.finish_time = None
         self.home_task_id = None
+
+        # NEW: We'll track this after we compute it
+        self.is_on_critical_path = False
 
     def add_resource_interval(self, start, end, resource_id):
         self.resource_intervals.append((start, end, resource_id))
@@ -50,17 +133,12 @@ class Node:
         return None
     
     def should_release_locked_resource(self):
-        """
-        If we currently lock some resource, check if we're still in the interval
-        that requires it. If not, we release it.
-        """
         if self.locked_resource is None:
             return False
         for (s, e, r_id) in self.resource_intervals:
-            # If we're still in an interval that uses locked_resource, don't release
             if r_id == self.locked_resource and (s <= self.exec_progress < e):
                 return False
-        return True  # no interval covers current exec_progress for locked_resource => release
+        return True
 
     def reset(self):
         self.remaining_time = self.wcet
@@ -69,6 +147,7 @@ class Node:
         self.completed = False
         self.locked_resource = None
         self.finish_time = None
+        # is_on_critical_path remains the same across runs (or reset if you prefer)
 
 class Resource:
     def __init__(self, resource_id, max_access_length):
@@ -76,11 +155,23 @@ class Resource:
         self.global_queue = deque()
 
     def enqueue_global(self, item, policy="FIFO"):
+        """
+        item = {
+          "node": node_obj,
+          "arrival_time": current_time,
+          "is_critical": node_obj.is_hard,
+          "is_crit_path": node_obj.is_on_critical_path
+        }
+        """
         self.global_queue.append(item)
-        if policy == "CPF":  # or "FPC" if you want
-            self.global_queue = deque(
-                sorted(self.global_queue, 
-                       key=lambda x: (not x['is_critical'], x['arrival_time'])))
+        if policy == "FPC":
+            # Sort by "on_critical_path" = True first, tie-break arrival_time
+            def priority(elem):
+                # 'is_crit_path' descending => we do (not elem["is_crit_path"]) 
+                # then arrival_time ascending
+                return (not elem["is_crit_path"], elem["arrival_time"])
+            sorted_list = sorted(self.global_queue, key=priority)
+            self.global_queue = deque(sorted_list)
 
     def front(self):
         return self.global_queue[0] if self.global_queue else None
@@ -190,9 +281,11 @@ def generate_one_task(task_id):
     t = Task(task_id, G, node_list, source_id, sink_id)
     t.critical_ratio = ratio_crit
 
-    # Assign deadlines to each node = T.D
+    # NEW: Compute is_on_critical_path for each node
+    is_crit_map = compute_is_on_critical_path(G, node_types, source_id, sink_id)
     for nd in t.node_list:
-        nd.deadline = t.D
+        nd.is_on_critical_path = is_crit_map[nd.node_id]
+        # (We also assigned nd.deadline in Task constructor)
 
     return t
 
@@ -240,12 +333,9 @@ def assign_resource_intervals_to_nodes(tasks, resources, resources_info):
                 node = random.choice(candidate_nodes)
                 candidate_nodes.remove(node)
 
-                # Attempt to create intervals (may be multiple intervals or just 1)
-                # For simplicity, let's just do usage_count times in one node
-                # or you can do more advanced logic.
                 for _ in range(usage_count):
                     interval_length = random.randint(1, min(max_len, node.wcet))
-                    for _ in range(10):  # up to 10 tries
+                    for _ in range(10):
                         start = random.randint(0, node.wcet - interval_length)
                         end = start + interval_length
                         conflict = any(
@@ -320,7 +410,7 @@ class POMIPScheduler:
         self.policy = policy
         self.time_limit = time_limit
         self.local_queues = {(t.task_id, r.resource_id): deque() for t in tasks for r in resources}
-        self.cluster_state = {t.task_id: [None] for t in tasks}  # One CPU per task
+        self.cluster_state = {t.task_id: [None] for t in tasks}
         self.resource_map = {r.resource_id: r for r in resources}
         self.schedule_log = []
 
@@ -331,7 +421,6 @@ class POMIPScheduler:
             if self.all_done():
                 break
 
-            # We'll store occupant + occupant's locked resource
             time_snapshot = {}
 
             for task in self.tasks:
@@ -349,21 +438,17 @@ class POMIPScheduler:
                         self.request_resource_local_queue(occupant, res, time)
 
                         if not occupant.in_critical_section:
-                            # Rule 1
                             preempted = self.apply_rule_one(task, occupant)
                             if not preempted:
                                 migrated = self.apply_rule_two(occupant, resource_id)
                                 if not migrated:
                                     self.cluster_state[task.task_id][0] = None
-                            # occupant might have changed after migration or preemption
                             occupant = self.cluster_state[task.task_id][0]
 
-                    # Occupant runs (if still occupant)
                     if occupant:
                         occupant.remaining_time -= 1
                         occupant.exec_progress += 1
 
-                        # Resource releasing check
                         if occupant.locked_resource and occupant.should_release_locked_resource():
                             self.release_resource_local_queue(occupant, self.resource_map[occupant.locked_resource])
                             if occupant.task_id != occupant.home_task_id:
@@ -374,7 +459,7 @@ class POMIPScheduler:
                             occupant.finish_time = time + 1
                             self.cluster_state[task.task_id][0] = None
 
-                # Log occupant info => tuple (node_id, locked_resource)
+                # Log occupant
                 occupant_final = self.cluster_state[task.task_id][0]
                 if occupant_final is not None:
                     time_snapshot[task.task_id] = (occupant_final.node_id, occupant_final.locked_resource)
@@ -409,14 +494,8 @@ class POMIPScheduler:
         for t in self.tasks:
             if t.task_id == blocking_node.task_id:
                 continue
-
-            # check if some node in t is blocked on resource_id
-            # simplified: we just check if t has local_queues with that resource
-            # or occupant is locked. We'll just let blocking_node migrate
-            # if there's a free CPU or preemptable CPU
             for idx, occupant in enumerate(self.cluster_state[t.task_id]):
                 if occupant is None:
-                    # free CPU => migrate
                     if blocking_node.home_task_id is None:
                         blocking_node.home_task_id = blocking_node.task_id
                     self.cluster_state[t.task_id][idx] = blocking_node
@@ -424,7 +503,6 @@ class POMIPScheduler:
                     return True
                 else:
                     if not occupant.in_critical_section:
-                        # preempt occupant
                         if blocking_node.home_task_id is None:
                             blocking_node.home_task_id = blocking_node.task_id
                         self.cluster_state[t.task_id][idx] = blocking_node
@@ -460,7 +538,6 @@ class POMIPScheduler:
         return all(n.completed for t in self.tasks for n in t.node_list if n.wcet>0)
 
     def pick_node_to_run(self, task):
-        # pick a node from that task
         cands = [n for n in task.node_list if not n.completed]
         h = [n for n in cands if n.is_hard and not n.in_critical_section]
         if h:
@@ -476,8 +553,16 @@ class POMIPScheduler:
         if node not in fq:
             fq.append(node)
         if fq and fq[0] == node:
-            resource.enqueue_global({"node": node, "arrival_time": time, "is_critical": node.is_hard}, self.policy)
-            if resource.front()["node"] == node:
+            # Enqueue with extra field is_crit_path=node.is_on_critical_path
+            item = {
+                "node": node,
+                "arrival_time": time,
+                "is_critical": node.is_hard,
+                "is_crit_path": node.is_on_critical_path
+            }
+            resource.enqueue_global(item, policy=self.policy)
+            front = resource.front()
+            if front and front["node"] == node:
                 node.in_critical_section = True
                 node.locked_resource = resource.resource_id
                 return True
@@ -491,20 +576,21 @@ class POMIPScheduler:
             fq.popleft()
         node.in_critical_section = False
         node.locked_resource = None
-        # next head
         if fq:
             head_node = fq[0]
-            resource.enqueue_global({"node": head_node, "arrival_time": 0, "is_critical": head_node.is_hard}, self.policy)
-            if resource.front() and resource.front()["node"] == head_node:
+            item = {
+                "node": head_node,
+                "arrival_time": 0,
+                "is_critical": head_node.is_hard,
+                "is_crit_path": head_node.is_on_critical_path
+            }
+            resource.enqueue_global(item, policy=self.policy)
+            front = resource.front()
+            if front and front["node"] == head_node:
                 head_node.in_critical_section = True
                 head_node.locked_resource = resource.resource_id
 
-    # ---------- Visualization for Gantt ----------
     def plot_schedule(self, title="POMIP Schedule", filename="schedule.png"):
-        """
-        We now stored schedule_log[t][task_id] = (occupant_node_id, occupant_locked_resource).
-        We'll parse those pairs, group consecutive intervals, and show resource usage in the label.
-        """
         fig, ax = plt.subplots(figsize=(10, 3 + len(self.tasks)*0.5))
 
         intervals_per_cluster = {t.task_id: [] for t in self.tasks}
@@ -534,7 +620,6 @@ class POMIPScheduler:
             intervals = intervals_per_cluster[t.task_id]
             for (start, end, occupant_id, locked_r) in intervals:
                 if occupant_id is not None:
-                    # find occupant node
                     occupant_node = None
                     for nd in t.node_list:
                         if nd.node_id == occupant_id:
@@ -549,14 +634,12 @@ class POMIPScheduler:
                     ax.barh(y, length, left=start, height=0.4, color=color,
                             edgecolor='black', alpha=0.8)
 
-                    # Label occupant + resource
                     label_str = str(occupant_id)
                     if locked_r is not None:
                         label_str += f"(R{locked_r})"
                     ax.text((start+end)/2, y, label_str, ha='center', va='center', 
                             color='white', fontsize=8)
                 else:
-                    # occupant is None => do nothing
                     pass
 
             ax.text(-2, y, f"Task {t.task_id}", va='center', fontsize=9)
@@ -579,23 +662,18 @@ class POMIPScheduler:
 def main():
     random.seed(0)
 
-    # 1) Generate tasks
     tasks = []
     for i in range(NUM_TASKS):
         t_info = generate_one_task(i+1)
         tasks.append(t_info)
 
-    # 2) Generate resources
     n_r = random.randint(*RESOURCE_RANGE)
     resources, resources_info = generate_resources(n_r, NUM_TASKS)
-
-    # 3) Assign partial intervals based on distribution
     assign_resource_intervals_to_nodes(tasks, resources, resources_info)
 
-    # 4) Print fed info
     m_fed, m_simple = federated_output(tasks, n_r)
 
-    # 5) POMIP with FIFO
+    # FIFO
     for t in tasks:
         t.reset_nodes()
     sched_fifo = POMIPScheduler(tasks, resources, policy="FIFO", time_limit=200)
@@ -606,10 +684,10 @@ def main():
     print("Avg QoS:", fifo_result["average_qos"])
     sched_fifo.plot_schedule(title="POMIP-FIFO Gantt", filename="fifo_schedule.png")
 
-    # 6) POMIP with FPC
+    # FPC (we interpret "FPC" as "sort by critical-path first")
     for t in tasks:
         t.reset_nodes()
-    sched_fpc = POMIPScheduler(tasks, resources, policy="CPF", time_limit=200)
+    sched_fpc = POMIPScheduler(tasks, resources, policy="FPC", time_limit=200)
     fpc_result = sched_fpc.run()
     print("\n=== POMIP (FPC) ===")
     print("Schedulable?", fpc_result["schedulable"])
