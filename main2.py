@@ -38,6 +38,7 @@ class Node:
         self.deadline = None  # assigned later
         self.task_id = None
         self.finish_time = None
+        self.home_task_id = None
 
     def add_resource_interval(self, start, end, resource_id):
         self.resource_intervals.append((start, end, resource_id))
@@ -176,6 +177,7 @@ def generate_one_task(task_id):
         is_hard = (node_types[n] == "Hard")
         nd = Node(n, w, is_hard)
         nd.task_id = task_id
+        nd.home_task_id = task_id
         node_list.append(nd)
 
     t = Task(task_id, G, node_list, source_id, sink_id)
@@ -329,7 +331,7 @@ class POMIPScheduler:
         self.policy = policy
         self.time_limit = time_limit
         self.local_queues = {(t.task_id, r.resource_id): deque() for t in tasks for r in resources}
-        self.cluster_state = {t.task_id: [None] for t in tasks}
+        self.cluster_state = {t.task_id: [None] for t in tasks}  # One CPU per task
         self.resource_map = {r.resource_id: r for r in resources}
         self.schedule_log = []
 
@@ -354,14 +356,27 @@ class POMIPScheduler:
                     if resource_id and not occupant.in_critical_section:
                         resource = self.resource_map[resource_id]
                         self.request_resource_local_queue(occupant, resource, time)
+
                         if not occupant.in_critical_section:
-                            self.cluster_state[task.task_id][0] = None
+                            # Rule 1: Try to preempt another node within the same task
+                            preempted = self.apply_rule_one(task, occupant)
+                            if not preempted:
+                                # Rule 2: Try migration to another task
+                                migrated = self.apply_rule_two(occupant, resource_id)
+                                if not migrated:
+                                    self.cluster_state[task.task_id][0] = None  # Blocked
                             continue
 
                     occupant.remaining_time -= 1
                     occupant.exec_progress += 1
+
+                    # Return to original task if critical section is done
                     if occupant.locked_resource and occupant.should_release_locked_resource():
                         self.release_resource_local_queue(occupant, self.resource_map[occupant.locked_resource])
+                        if occupant.task_id != occupant.home_task_id:
+                            # Return to original task after critical section
+                            self.return_to_original_task(occupant)
+
                     if occupant.remaining_time <= 0:
                         occupant.completed = True
                         occupant.finish_time = time + 1
@@ -385,6 +400,46 @@ class POMIPScheduler:
         avg_qos = self.compute_qos()
         return {"schedulable": schedulable, "finish_time": time, "average_qos": avg_qos}
 
+    def apply_rule_one(self, task, blocking_node):
+        """Rule 1: Preempt a non-critical node in the current task if possible."""
+        for idx, occupant in enumerate(self.cluster_state[task.task_id]):
+            if occupant and not occupant.in_critical_section:
+                # Preempt the occupant
+                self.cluster_state[task.task_id][idx] = blocking_node
+                return True
+        return False
+
+    def apply_rule_two(self, blocking_node, resource_id):
+        """Rule 2: Migrate the blocking node to another task if it blocks other tasks."""
+        for t in self.tasks:
+            if t.task_id == blocking_node.task_id:
+                continue
+
+            # Check if a node in this task is blocked by the same resource
+            for node in t.node_list:
+                if node.locked_resource == resource_id and not node.completed:
+                    # Set home task if not already set (important for returning)
+                    if blocking_node.home_task_id is None:
+                        blocking_node.home_task_id = blocking_node.task_id
+
+                    # Migrate the blocking node to this task’s CPU
+                    for idx, occupant in enumerate(self.cluster_state[t.task_id]):
+                        if occupant is None:  # Found a free CPU
+                            self.cluster_state[t.task_id][idx] = blocking_node
+                            blocking_node.task_id = t.task_id  # Update current task id
+                            return True
+        return False
+
+    def return_to_original_task(self, node):
+        """Move the node back to its original task after completing its critical section."""
+        original_task_id = node.home_task_id
+        for idx, occupant in enumerate(self.cluster_state[original_task_id]):
+            if occupant is None:  # Find a free CPU in the original task
+                self.cluster_state[original_task_id][idx] = node
+                node.task_id = original_task_id  # Restore task id
+                node.home_task_id = None  # Clear home_task_id after return
+                return
+            
     def compute_qos(self):
         total_qos = 0.0
         count = 0
@@ -398,7 +453,7 @@ class POMIPScheduler:
                         delay = max(0, node.finish_time - node.deadline)
                         total_qos += max(0, 1.0 - 0.30 * delay)
         return total_qos / count if count else 1.0
-
+    
     def all_done(self):
         return all(node.completed for task in self.tasks for node in task.node_list if node.wcet > 0)
 
@@ -419,6 +474,8 @@ class POMIPScheduler:
             if resource.front()['node'] == node:
                 node.in_critical_section = True
                 node.locked_resource = resource.resource_id
+                return True
+        return False
 
     def release_resource_local_queue(self, node, resource):
         resource.remove_item(node)
@@ -427,33 +484,6 @@ class POMIPScheduler:
             fq.popleft()
         node.in_critical_section = False
         node.locked_resource = None
-
-    # ----------- POMIP Rules #1, #2 -----------
-
-    def attempt_preemption_in_cluster(self, cluster_cpus, node):
-        for idx, occupant in enumerate(cluster_cpus):
-            if occupant is None:
-                return idx
-        if node.in_critical_section:
-            for idx, occupant in enumerate(cluster_cpus):
-                if occupant and not occupant.in_critical_section:
-                    return idx
-        return None
-
-    def attempt_migration_if_blocked(self, node, resource_id):
-        home_tid = node.task_id
-        for t in self.tasks:
-            if t.task_id == home_tid:
-                continue
-            if len(self.local_queues[(t.task_id, resource_id)]) > 0:
-                cluster_cpus = self.cluster_state[t.task_id]
-                idx = self.attempt_preemption_in_cluster(cluster_cpus, node)
-                if idx is not None:
-                    if cluster_cpus[idx] is not None:
-                        cluster_cpus[idx] = None
-                    cluster_cpus[idx] = node
-                    return True
-        return False
 
     # ---------- Visualization for Gantt ----------
 
