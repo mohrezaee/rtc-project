@@ -8,7 +8,7 @@ from collections import deque
 # --------------------------------------------------------
 # 1) Global Parameter Settings (old variables)
 # --------------------------------------------------------
-NUM_TASKS = 2  # Number of tasks to generate
+NUM_TASKS = 100  # Number of tasks to generate
 NODES_RANGE = (5, 20)      # Range for # of intermediate nodes
 WCET_RANGE = (13, 30)      # Range for each node's WCET
 P_EDGE = 0.1               # Probability of edge creation in DAG
@@ -50,12 +50,17 @@ class Node:
         return None
     
     def should_release_locked_resource(self):
+        """
+        If we currently lock some resource, check if we're still in the interval
+        that requires it. If not, we release it.
+        """
         if self.locked_resource is None:
             return False
         for (s, e, r_id) in self.resource_intervals:
-            if s <= self.exec_progress < e and r_id == self.locked_resource:
+            # If we're still in an interval that uses locked_resource, don't release
+            if r_id == self.locked_resource and (s <= self.exec_progress < e):
                 return False
-        return True
+        return True  # no interval covers current exec_progress for locked_resource => release
 
     def reset(self):
         self.remaining_time = self.wcet
@@ -72,8 +77,10 @@ class Resource:
 
     def enqueue_global(self, item, policy="FIFO"):
         self.global_queue.append(item)
-        if policy == "CPF":
-            self.global_queue = deque(sorted(self.global_queue, key=lambda x: (not x['is_critical'], x['arrival_time'])))
+        if policy == "CPF":  # or "FPC" if you want
+            self.global_queue = deque(
+                sorted(self.global_queue, 
+                       key=lambda x: (not x['is_critical'], x['arrival_time'])))
 
     def front(self):
         return self.global_queue[0] if self.global_queue else None
@@ -187,20 +194,7 @@ def generate_one_task(task_id):
     for nd in t.node_list:
         nd.deadline = t.D
 
-    # optional: plot
     return t
-
-def hierarchy_pos(G, root, width=1.0, vert_gap=0.2, vert_loc=0, xcenter=0.5):
-    pos = {root: (xcenter, vert_loc)}
-    neighbors = list(G.successors(root))
-    if len(neighbors) != 0:
-        dx = width / len(neighbors)
-        nextx = xcenter - width/2 - dx/2
-        for neighbor in neighbors:
-            nextx += dx
-            pos.update(hierarchy_pos(G, neighbor, width=dx, vert_gap=vert_gap,
-                                     vert_loc=vert_loc-vert_gap, xcenter=nextx))
-    return pos
 
 # --------------------------------------------------------
 # 4) Resource Generation
@@ -246,29 +240,24 @@ def assign_resource_intervals_to_nodes(tasks, resources, resources_info):
                 node = random.choice(candidate_nodes)
                 candidate_nodes.remove(node)
 
-                # Avoid overlapping intervals or nested requests by checking conflicts
-                current_intervals = node.resource_intervals
-
+                # Attempt to create intervals (may be multiple intervals or just 1)
+                # For simplicity, let's just do usage_count times in one node
+                # or you can do more advanced logic.
                 for _ in range(usage_count):
-                    # Determine an interval length within the allowable bounds
                     interval_length = random.randint(1, min(max_len, node.wcet))
-
-                    # Try multiple times to find a valid non-conflicting interval
-                    for _ in range(10):  # Give 10 tries to find a valid interval
+                    for _ in range(10):  # up to 10 tries
                         start = random.randint(0, node.wcet - interval_length)
                         end = start + interval_length
-
-                        # Check for conflicts
                         conflict = any(
-                            (s < end and start < e) and (r == rid)  # Overlap with same resource
-                            for (s, e, r) in current_intervals
+                            (s < end and start < e) and (r == rid)
+                            for (s, e, r) in node.resource_intervals
                         )
-
                         if not conflict:
                             node.add_resource_interval(start, end, rid)
                             usage_count -= 1
                             break
-
+                    if usage_count <= 0:
+                        break
 
 # --------------------------------------------------------
 # 5) Federated Scheduling Code
@@ -325,7 +314,7 @@ def federated_output(tasks, n_r):
 # --------------------------------------------------------
 
 class POMIPScheduler:
-    def __init__(self, tasks, resources, policy="FIFO", time_limit=2000):
+    def __init__(self, tasks, resources, policy="FIFO", time_limit=200):
         self.tasks = tasks
         self.resources = resources
         self.policy = policy
@@ -341,51 +330,60 @@ class POMIPScheduler:
         while time < self.time_limit:
             if self.all_done():
                 break
+
+            # We'll store occupant + occupant's locked resource
             time_snapshot = {}
 
             for task in self.tasks:
-                cpu = self.cluster_state[task.task_id][0]
-                if cpu is None:
+                occupant = self.cluster_state[task.task_id][0]
+                if occupant is None:
                     node = self.pick_node_to_run(task)
                     if node:
                         self.cluster_state[task.task_id][0] = node
+                        occupant = node
 
-                occupant = self.cluster_state[task.task_id][0]
                 if occupant:
                     resource_id = occupant.get_resource_needed_now()
                     if resource_id and not occupant.in_critical_section:
-                        resource = self.resource_map[resource_id]
-                        self.request_resource_local_queue(occupant, resource, time)
+                        res = self.resource_map[resource_id]
+                        self.request_resource_local_queue(occupant, res, time)
 
                         if not occupant.in_critical_section:
-                            # Rule 1: Try to preempt another node within the same task
+                            # Rule 1
                             preempted = self.apply_rule_one(task, occupant)
                             if not preempted:
-                                # Rule 2: Try migration to another task
                                 migrated = self.apply_rule_two(occupant, resource_id)
                                 if not migrated:
-                                    self.cluster_state[task.task_id][0] = None  # Blocked
-                            continue
+                                    self.cluster_state[task.task_id][0] = None
+                            # occupant might have changed after migration or preemption
+                            occupant = self.cluster_state[task.task_id][0]
 
-                    occupant.remaining_time -= 1
-                    occupant.exec_progress += 1
+                    # Occupant runs (if still occupant)
+                    if occupant:
+                        occupant.remaining_time -= 1
+                        occupant.exec_progress += 1
 
-                    # Return to original task if critical section is done
-                    if occupant.locked_resource and occupant.should_release_locked_resource():
-                        self.release_resource_local_queue(occupant, self.resource_map[occupant.locked_resource])
-                        if occupant.task_id != occupant.home_task_id:
-                            # Return to original task after critical section
-                            self.return_to_original_task(occupant)
+                        # Resource releasing check
+                        if occupant.locked_resource and occupant.should_release_locked_resource():
+                            self.release_resource_local_queue(occupant, self.resource_map[occupant.locked_resource])
+                            if occupant.task_id != occupant.home_task_id:
+                                self.return_to_original_task(occupant)
 
-                    if occupant.remaining_time <= 0:
-                        occupant.completed = True
-                        occupant.finish_time = time + 1
-                        self.cluster_state[task.task_id][0] = None
+                        if occupant.remaining_time <= 0:
+                            occupant.completed = True
+                            occupant.finish_time = time + 1
+                            self.cluster_state[task.task_id][0] = None
 
-                time_snapshot[task.task_id] = occupant.node_id if occupant else None
+                # Log occupant info => tuple (node_id, locked_resource)
+                occupant_final = self.cluster_state[task.task_id][0]
+                if occupant_final is not None:
+                    time_snapshot[task.task_id] = (occupant_final.node_id, occupant_final.locked_resource)
+                else:
+                    time_snapshot[task.task_id] = (None, None)
 
-            for task in self.tasks:
-                for node in task.node_list:
+            # Deadline check
+            for t in self.tasks:
+                for node in t.node_list:
                     if node.is_hard and not node.completed and time >= node.deadline:
                         schedulable = False
                         break
@@ -401,77 +399,85 @@ class POMIPScheduler:
         return {"schedulable": schedulable, "finish_time": time, "average_qos": avg_qos}
 
     def apply_rule_one(self, task, blocking_node):
-        """Rule 1: Preempt a non-critical node in the current task if possible."""
         for idx, occupant in enumerate(self.cluster_state[task.task_id]):
             if occupant and not occupant.in_critical_section:
-                # Preempt the occupant
                 self.cluster_state[task.task_id][idx] = blocking_node
                 return True
         return False
 
     def apply_rule_two(self, blocking_node, resource_id):
-        """Rule 2: Migrate the blocking node to another task if it blocks other tasks."""
         for t in self.tasks:
             if t.task_id == blocking_node.task_id:
                 continue
 
-            # Check if a node in this task is blocked by the same resource
-            for node in t.node_list:
-                if node.locked_resource == resource_id and not node.completed:
-                    # Set home task if not already set (important for returning)
+            # check if some node in t is blocked on resource_id
+            # simplified: we just check if t has local_queues with that resource
+            # or occupant is locked. We'll just let blocking_node migrate
+            # if there's a free CPU or preemptable CPU
+            for idx, occupant in enumerate(self.cluster_state[t.task_id]):
+                if occupant is None:
+                    # free CPU => migrate
                     if blocking_node.home_task_id is None:
                         blocking_node.home_task_id = blocking_node.task_id
-
-                    # Migrate the blocking node to this task’s CPU
-                    for idx, occupant in enumerate(self.cluster_state[t.task_id]):
-                        if occupant is None:  # Found a free CPU
-                            self.cluster_state[t.task_id][idx] = blocking_node
-                            blocking_node.task_id = t.task_id  # Update current task id
-                            return True
+                    self.cluster_state[t.task_id][idx] = blocking_node
+                    blocking_node.task_id = t.task_id
+                    return True
+                else:
+                    if not occupant.in_critical_section:
+                        # preempt occupant
+                        if blocking_node.home_task_id is None:
+                            blocking_node.home_task_id = blocking_node.task_id
+                        self.cluster_state[t.task_id][idx] = blocking_node
+                        blocking_node.task_id = t.task_id
+                        return True
         return False
 
     def return_to_original_task(self, node):
-        """Move the node back to its original task after completing its critical section."""
-        original_task_id = node.home_task_id
-        for idx, occupant in enumerate(self.cluster_state[original_task_id]):
-            if occupant is None:  # Find a free CPU in the original task
-                self.cluster_state[original_task_id][idx] = node
-                node.task_id = original_task_id  # Restore task id
-                node.home_task_id = None  # Clear home_task_id after return
+        orig_id = node.home_task_id
+        for idx, occupant in enumerate(self.cluster_state[orig_id]):
+            if occupant is None:
+                self.cluster_state[orig_id][idx] = node
+                node.task_id = orig_id
+                node.home_task_id = None
                 return
-            
+
     def compute_qos(self):
         total_qos = 0.0
         count = 0
         for task in self.tasks:
             for node in task.node_list:
-                if not node.is_hard and node.wcet > 0:
+                if not node.is_hard and node.wcet>0:
                     count += 1
                     if node.finish_time is None:
                         total_qos += 0
                     else:
                         delay = max(0, node.finish_time - node.deadline)
-                        total_qos += max(0, 1.0 - 0.30 * delay)
+                        q = max(0, 1.0 - 0.30*delay)
+                        total_qos += q
         return total_qos / count if count else 1.0
     
     def all_done(self):
-        return all(node.completed for task in self.tasks for node in task.node_list if node.wcet > 0)
+        return all(n.completed for t in self.tasks for n in t.node_list if n.wcet>0)
 
     def pick_node_to_run(self, task):
-        candidates = [n for n in task.node_list if not n.completed]
-        hard_nodes = [n for n in candidates if n.is_hard]
-        if hard_nodes:
-            return hard_nodes[0]
-        soft_nodes = [n for n in candidates if not n.is_hard]
-        return soft_nodes[0] if soft_nodes else None
+        # pick a node from that task
+        cands = [n for n in task.node_list if not n.completed]
+        h = [n for n in cands if n.is_hard and not n.in_critical_section]
+        if h:
+            return h[0]
+        s = [n for n in cands if not n.is_hard]
+        if s:
+            return s[0]
+        return None
 
     def request_resource_local_queue(self, node, resource, time):
-        fq = self.local_queues[(node.task_id, resource.resource_id)]
+        key = (node.task_id, resource.resource_id)
+        fq = self.local_queues[key]
         if node not in fq:
             fq.append(node)
-        if fq[0] == node:
+        if fq and fq[0] == node:
             resource.enqueue_global({"node": node, "arrival_time": time, "is_critical": node.is_hard}, self.policy)
-            if resource.front()['node'] == node:
+            if resource.front()["node"] == node:
                 node.in_critical_section = True
                 node.locked_resource = resource.resource_id
                 return True
@@ -479,26 +485,28 @@ class POMIPScheduler:
 
     def release_resource_local_queue(self, node, resource):
         resource.remove_item(node)
-        fq = self.local_queues[(node.task_id, resource.resource_id)]
+        key = (node.task_id, resource.resource_id)
+        fq = self.local_queues[key]
         if fq and fq[0] == node:
             fq.popleft()
         node.in_critical_section = False
         node.locked_resource = None
+        # next head
+        if fq:
+            head_node = fq[0]
+            resource.enqueue_global({"node": head_node, "arrival_time": 0, "is_critical": head_node.is_hard}, self.policy)
+            if resource.front() and resource.front()["node"] == head_node:
+                head_node.in_critical_section = True
+                head_node.locked_resource = resource.resource_id
 
     # ---------- Visualization for Gantt ----------
-
     def plot_schedule(self, title="POMIP Schedule", filename="schedule.png"):
         """
-        Create a Gantt-like chart from self.schedule_log:
-          self.schedule_log[time][task_id] = node_id or None
-        Each cluster is a "row" in the chart, time is the x-axis.
-        We color nodes by node_id or is_hard status.
+        We now stored schedule_log[t][task_id] = (occupant_node_id, occupant_locked_resource).
+        We'll parse those pairs, group consecutive intervals, and show resource usage in the label.
         """
-        # We'll create a figure with one row per task
         fig, ax = plt.subplots(figsize=(10, 3 + len(self.tasks)*0.5))
 
-        # Build an array: schedule_log[t][tid] = node_id or None
-        # We'll store intervals as (start, end, occupant) for each cluster
         intervals_per_cluster = {t.task_id: [] for t in self.tasks}
 
         if not self.schedule_log:
@@ -508,54 +516,55 @@ class POMIPScheduler:
             return
 
         max_time = len(self.schedule_log)
-        # We'll parse the log
-        # For each cluster (task_id), we gather consecutive time intervals where occupant = same node_id
         for t_idx in range(max_time):
             snapshot = self.schedule_log[t_idx]
-            for task_id, node_id in snapshot.items():
+            for task_id, (nid, locked_r) in snapshot.items():
                 intervals = intervals_per_cluster[task_id]
                 if not intervals:
-                    # new interval
-                    intervals.append([t_idx, t_idx+1, node_id]) # [start, end, occupant]
+                    intervals.append([t_idx, t_idx+1, nid, locked_r])
                 else:
                     last = intervals[-1]
-                    if last[2] == node_id:
-                        # extend
+                    if last[2] == nid and last[3] == locked_r:
                         last[1] = t_idx+1
                     else:
-                        # new
-                        intervals.append([t_idx, t_idx+1, node_id])
+                        intervals.append([t_idx, t_idx+1, nid, locked_r])
 
-        # Now we plot each cluster as a "row"
-        # cluster y = (some index), occupant is a rectangle from [start..end]
-        ybase = 0
         for i, t in enumerate(self.tasks):
-            y = i  # row index
+            y = i
             intervals = intervals_per_cluster[t.task_id]
-            for (start, end, occupant) in intervals:
-                if occupant is not None:
-                    # color for occupant
-                    # let's say if occupant is Hard => color='red', else 'green'
-                    node_obj = None
+            for (start, end, occupant_id, locked_r) in intervals:
+                if occupant_id is not None:
+                    # find occupant node
+                    occupant_node = None
                     for nd in t.node_list:
-                        if nd.node_id == occupant:
-                            node_obj = nd
+                        if nd.node_id == occupant_id:
+                            occupant_node = nd
                             break
-                    if node_obj and node_obj.is_hard:
+                    if occupant_node and occupant_node.is_hard:
                         color = 'red'
                     else:
                         color = 'green'
-                    ax.barh(y, end-start, left=start, height=0.4, color=color,
+
+                    length = end - start
+                    ax.barh(y, length, left=start, height=0.4, color=color,
                             edgecolor='black', alpha=0.8)
 
-                    ax.text((start+end)/2, y, f"{occupant}", ha='center', va='center', color='white', fontsize=8)
+                    # Label occupant + resource
+                    label_str = str(occupant_id)
+                    if locked_r is not None:
+                        label_str += f"(R{locked_r})"
+                    ax.text((start+end)/2, y, label_str, ha='center', va='center', 
+                            color='white', fontsize=8)
+                else:
+                    # occupant is None => do nothing
+                    pass
 
             ax.text(-2, y, f"Task {t.task_id}", va='center', fontsize=9)
 
         ax.set_xlim(0, max_time)
         ax.set_ylim(-1, len(self.tasks))
         ax.set_xlabel("Time")
-        ax.set_ylabel("Cluster( Task )")
+        ax.set_ylabel("Task (Cluster)")
         ax.set_yticks([])
         plt.title(title)
         plt.tight_layout()
@@ -595,20 +604,19 @@ def main():
     print("Schedulable?", fifo_result["schedulable"])
     print("Finish time:", fifo_result["finish_time"])
     print("Avg QoS:", fifo_result["average_qos"])
-    # Visualize
     sched_fifo.plot_schedule(title="POMIP-FIFO Gantt", filename="fifo_schedule.png")
 
     # 6) POMIP with FPC
     for t in tasks:
         t.reset_nodes()
-    sched_fpc = POMIPScheduler(tasks, resources, policy="FPC", time_limit=200)
+    sched_fpc = POMIPScheduler(tasks, resources, policy="CPF", time_limit=200)
     fpc_result = sched_fpc.run()
     print("\n=== POMIP (FPC) ===")
     print("Schedulable?", fpc_result["schedulable"])
     print("Finish time:", fpc_result["finish_time"])
     print("Avg QoS:", fpc_result["average_qos"])
-    # Visualize
     sched_fpc.plot_schedule(title="POMIP-FPC Gantt", filename="fpc_schedule.png")
+
 
 if __name__ == "__main__":
     main()
