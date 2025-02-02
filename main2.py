@@ -327,6 +327,7 @@ def assign_resource_intervals_to_nodes(tasks, resources, resources_info):
         for i, usage_count in enumerate(distribution):
             if usage_count <= 0:
                 continue
+            print(f'resources for task {i}')
             candidate_nodes = [nd for nd in tasks[i].node_list if nd.wcet > 0]
 
             while usage_count > 0 and candidate_nodes:
@@ -344,6 +345,7 @@ def assign_resource_intervals_to_nodes(tasks, resources, resources_info):
                         )
                         if not conflict:
                             node.add_resource_interval(start, end, rid)
+                            print(f'node {node.node_id} resource {rid} from {start} to {end}')
                             usage_count -= 1
                             break
                     if usage_count <= 0:
@@ -745,7 +747,7 @@ def main():
     # FIFO
     for t in tasks:
         t.reset_nodes()
-    sched_fifo = POMIPScheduler(tasks, resources, policy="FIFO", time_limit=200)
+    sched_fifo = POMIPScheduler(tasks, resources, policy="FIFO", time_limit=2000)
     fifo_result = sched_fifo.run()
     print("\n=== POMIP (FIFO) ===")
     print("Schedulable?", fifo_result["schedulable"])
@@ -756,7 +758,7 @@ def main():
     # FPC
     for t in tasks:
         t.reset_nodes()
-    sched_fpc = POMIPScheduler(tasks, resources, policy="FPC", time_limit=200)
+    sched_fpc = POMIPScheduler(tasks, resources, policy="FPC", time_limit=2000)
     fpc_result = sched_fpc.run()
     print("\n=== POMIP (FPC) ===")
     print("Schedulable?", fpc_result["schedulable"])
